@@ -51,9 +51,6 @@ mod remote_info;
 /// attempted more frequently than at this interval.
 const HOLEPUNCH_ATTEMPTS_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The latency at or under which we don't try to upgrade to a better path.
-const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
-
 // TODO: use this
 // /// How long since the last activity we try to keep an established endpoint peering alive.
 // ///
@@ -62,7 +59,7 @@ const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
 
 /// How often we try to upgrade to a better path.
 ///
-/// Even if we have some non-relay route that works.
+/// Only connections without a usable IP path need upgrading.
 const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The time after which an idle [`RemoteStateActor`] stops.
@@ -752,40 +749,38 @@ impl RemoteStateActor {
 
     /// Handles regularly checking if any paths need hole punching currently
     ///
-    /// Currently we need to have 1 IP path, with a good enough latency.
+    /// Each connection needs at least one usable IP path.
     fn check_connections(&mut self) {
-        let mut is_goodenough = true;
-        for conn_state in self.connections.values() {
-            let mut is_conn_goodenough = false;
-            if let Some(conn) = conn_state.handle.upgrade() {
-                let min_ip_rtt = conn_state
-                    .paths
-                    .iter()
-                    .filter_map(|(path_id, addr)| {
-                        if addr.is_ip() {
-                            conn.path_stats(*path_id).map(|stats| stats.rtt)
-                        } else {
-                            None
-                        }
-                    })
-                    .min();
-
-                if let Some(min_ip_rtt) = min_ip_rtt {
-                    let is_latency_goodenough = min_ip_rtt <= GOOD_ENOUGH_LATENCY;
-                    is_conn_goodenough = is_latency_goodenough;
-                } else {
-                    // No IP transport found
-                    is_conn_goodenough = false;
-                }
-            }
-            is_goodenough &= is_conn_goodenough;
-        }
-
-        if !is_goodenough {
+        let connections = self.connections.values().map(|conn_state| {
+            let conn = conn_state.handle.upgrade();
+            conn_state.paths.iter().map(move |(path_id, addr)| {
+                // Paths are registered on establishment and removed on abandonment.
+                let stats = conn
+                    .as_ref()
+                    .filter(|_| addr.is_ip())
+                    .and_then(|conn| conn.path_stats(*path_id));
+                (addr, stats)
+            })
+        });
+        if connections_need_holepunching(connections) {
             debug!("connections are not good enough, triggering holepunching");
             self.trigger_holepunching();
         }
     }
+}
+
+/// Checks whether any connection lacks an established IP path with available stats.
+fn connections_need_holepunching<'a>(
+    connections: impl IntoIterator<
+        Item = impl IntoIterator<Item = (&'a transports::FourTuple, Option<PathStats>)>,
+    >,
+) -> bool {
+    // A working direct path is enough: internet RTTs should not cause periodic NAT traversal.
+    connections.into_iter().any(|paths| {
+        !paths
+            .into_iter()
+            .any(|(addr, stats)| addr.is_ip() && stats.is_some())
+    })
 }
 
 impl State {
@@ -1565,6 +1560,80 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
 #[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
+
+    fn ip_path() -> transports::FourTuple {
+        transports::FourTuple::from_remote(transports::Addr::Ip("192.0.2.1:1234".parse().unwrap()))
+    }
+
+    fn relay_path() -> transports::FourTuple {
+        transports::FourTuple::Relay {
+            url: "https://relay.example.invalid".parse().unwrap(),
+            endpoint_id: iroh_base::SecretKey::from_bytes(&[1; 32]).public(),
+        }
+    }
+
+    fn high_rtt_stats() -> PathStats {
+        let mut stats = PathStats::default();
+        stats.rtt = Duration::from_millis(140);
+        stats
+    }
+
+    #[test]
+    fn high_rtt_ip_path_does_not_need_holepunching() {
+        assert!(!connections_need_holepunching([[(
+            &ip_path(),
+            Some(high_rtt_stats())
+        )]]));
+    }
+
+    #[test]
+    fn relay_only_connection_needs_holepunching() {
+        assert!(connections_need_holepunching([[(
+            &relay_path(),
+            Some(PathStats::default())
+        )]]));
+    }
+
+    #[test]
+    fn connection_without_paths_needs_holepunching() {
+        assert!(connections_need_holepunching([std::iter::empty()]));
+    }
+
+    #[test]
+    fn abandoned_ip_path_needs_holepunching() {
+        let ip = ip_path();
+        let relay = relay_path();
+        let mut paths = vec![
+            (&ip, Some(high_rtt_stats())),
+            (&relay, Some(PathStats::default())),
+        ];
+        assert!(!connections_need_holepunching([paths.clone()]));
+        // The Abandoned event removes the path, even if noq retains its stats.
+        paths.retain(|(addr, _)| !addr.is_ip());
+        assert!(connections_need_holepunching([paths]));
+    }
+
+    #[test]
+    fn ip_path_without_stats_needs_holepunching() {
+        assert!(connections_need_holepunching([[(&ip_path(), None)]]));
+    }
+
+    #[test]
+    fn mixed_connections_need_holepunching() {
+        let ip = ip_path();
+        let relay = relay_path();
+        let good = [(&ip, Some(high_rtt_stats()))];
+        let relay_only = [(&relay, Some(PathStats::default()))];
+        assert!(connections_need_holepunching([good, relay_only]));
+        assert!(connections_need_holepunching([relay_only, good]));
+    }
+
+    #[test]
+    fn no_connections_do_not_need_holepunching() {
+        assert!(!connections_need_holepunching(std::iter::empty::<
+            [(&transports::FourTuple, Option<PathStats>); 0],
+        >()));
+    }
 
     #[tokio::test]
     async fn blocked_relay_does_not_delay_direct_initial() {
